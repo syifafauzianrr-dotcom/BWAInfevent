@@ -26,6 +26,63 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
+// Local simulated rooms database helper
+const getLocalRooms = (): Record<string, Room> => {
+  try {
+    const raw = localStorage.getItem('pilihmana_local_rooms');
+    return raw ? JSON.parse(raw) : {};
+  } catch (e) {
+    return {};
+  }
+};
+
+const saveLocalRooms = (rooms: Record<string, Room>) => {
+  try {
+    localStorage.setItem('pilihmana_local_rooms', JSON.stringify(rooms));
+  } catch (e) {}
+};
+
+const createLocalRoom = (title: string, description: string, optionsText: string[]): Room => {
+  const roomId = "L" + Math.random().toString(36).substring(2, 7).toUpperCase();
+  const options: Option[] = optionsText.map((text: string, idx: number) => ({
+    id: `opt-${idx}-${Math.random().toString(36).substring(2, 7)}`,
+    text: text.trim(),
+    isEliminated: false,
+    color: pastelColors[idx % pastelColors.length]
+  }));
+  const newRoom: Room = {
+    id: roomId,
+    title: title.trim(),
+    description: (description || "").trim(),
+    options,
+    voters: {},
+    isEnded: false,
+    spinning: false,
+    resultOptionId: null,
+    vetoedOptionIds: [],
+    createdAt: Date.now()
+  };
+  const rooms = getLocalRooms();
+  rooms[roomId] = newRoom;
+  saveLocalRooms(rooms);
+  return newRoom;
+};
+
+const getLocalRoom = (id: string): Room | null => {
+  const rooms = getLocalRooms();
+  return rooms[id.toUpperCase()] || null;
+};
+
+const updateLocalRoom = (id: string, updater: (room: Room) => void): Room | null => {
+  const rooms = getLocalRooms();
+  const room = rooms[id.toUpperCase()];
+  if (!room) return null;
+  updater(room);
+  rooms[id.toUpperCase()] = room;
+  saveLocalRooms(rooms);
+  return room;
+};
+
 interface GroupDeciderProps {
   soundEnabled: boolean;
   setSoundEnabled: (enabled: boolean) => void;
@@ -46,6 +103,7 @@ export default function GroupDecider({
   const [roomId, setRoomId] = useState<string | null>(initialRoomId);
   const [username, setUsername] = useState<string>('');
   const [isJoined, setIsJoined] = useState(false);
+  const [isLocalMode, setIsLocalMode] = useState(false);
   const [loading, setLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   
@@ -76,7 +134,20 @@ export default function GroupDecider({
   // Poll room data when joined
   useEffect(() => {
     if (roomId) {
+      if (roomId.toUpperCase().startsWith('L')) {
+        setIsLocalMode(true);
+      }
       fetchRoomData();
+      
+      const isLoc = roomId.toUpperCase().startsWith('L');
+      if (isLoc) {
+        if (pollingIntervalRef.current) {
+          clearInterval(pollingIntervalRef.current);
+          pollingIntervalRef.current = null;
+        }
+        return;
+      }
+
       // Start polling every 1.5 seconds for real-time synchronization
       if (pollingIntervalRef.current) clearInterval(pollingIntervalRef.current);
       
@@ -86,6 +157,7 @@ export default function GroupDecider({
     } else {
       setRoom(null);
       setIsJoined(false);
+      setIsLocalMode(false);
       if (pollingIntervalRef.current) {
         clearInterval(pollingIntervalRef.current);
         pollingIntervalRef.current = null;
@@ -148,24 +220,25 @@ export default function GroupDecider({
         })
       });
 
-      if (!res.ok) {
-        const errData = await res.json();
-        throw new Error(errData.error || "Gagal membuat ruangan.");
+      const contentType = res.headers.get("content-type");
+      if (!res.ok || (contentType && contentType.includes("text/html"))) {
+        throw new Error("HTML response");
       }
 
       const freshRoom: Room = await res.json();
       setRoomId(freshRoom.id);
       setRoom(freshRoom);
-      
-      // Auto register name as creator (or wait for join login screen)
-      // We will show the join credential card next
+      setIsLocalMode(false);
     } catch (e: any) {
-      const errMsg = e.message || "";
-      if (errMsg.includes("Unexpected token") || errMsg.includes("not valid JSON")) {
-        setErrorMsg("Server sedang melakukan persiapan/membangun ulang setelah update. Harap tunggu 3-5 detik lalu klik konfirmasi lagi! 🚀");
-      } else {
-        setErrorMsg(errMsg || "Gagal menghubungi server.");
-      }
+      console.log("Failed to contact server, falling back to Local Storage...", e);
+      const localRoom = createLocalRoom(createTitle, createDescription, validOptions);
+      setRoomId(localRoom.id);
+      setRoom(localRoom);
+      setIsLocalMode(true);
+      
+      const savedName = localStorage.getItem(USER_NAME_KEY) || "Pemain 1";
+      localRoom.voters[savedName] = null;
+      updateLocalRoom(localRoom.id, () => {}); // Save it
     } finally {
       setLoading(false);
     }
@@ -174,10 +247,28 @@ export default function GroupDecider({
   // Fetch Room Data (with loaders)
   const fetchRoomData = async () => {
     if (!roomId) return;
+    
+    if (roomId.toUpperCase().startsWith('L') || isLocalMode) {
+      const localRoom = getLocalRoom(roomId);
+      if (localRoom) {
+        setRoom(localRoom);
+        setIsLocalMode(true);
+        const savedName = localStorage.getItem(USER_NAME_KEY);
+        if (savedName && localRoom.voters[savedName] !== undefined) {
+          setIsJoined(true);
+        }
+      } else {
+        setErrorMsg("Ruangan lokal tidak ditemukan.");
+        setRoomId(null);
+      }
+      return;
+    }
+
     try {
       const res = await fetch(`/api/rooms/${roomId}`);
-      if (!res.ok) {
-        throw new Error("Ruangan tidak ditemukan atau server offline.");
+      const contentType = res.headers.get("content-type");
+      if (!res.ok || (contentType && contentType.includes("text/html"))) {
+        throw new Error("HTML response / Server offline");
       }
       const data: Room = await res.json();
       setRoom(data);
@@ -188,17 +279,37 @@ export default function GroupDecider({
         setIsJoined(true);
       }
     } catch (e: any) {
-      setErrorMsg(e.message || "Gagal terhubung dengan server.");
-      setRoomId(null);
+      const localRoom = getLocalRoom(roomId);
+      if (localRoom) {
+        setRoom(localRoom);
+        setIsLocalMode(true);
+        const savedName = localStorage.getItem(USER_NAME_KEY);
+        if (savedName && localRoom.voters[savedName] !== undefined) {
+          setIsJoined(true);
+        }
+      } else {
+        setErrorMsg("Harap tunggu sebentar, server sedang mempersiapkan koneksi...");
+        // Non-blocking, keep trying
+      }
     }
   };
 
   // Silent polling to avoid interface visual flickering
   const fetchRoomDataSilent = async () => {
     if (!roomId) return;
+    
+    if (roomId.toUpperCase().startsWith('L') || isLocalMode) {
+      const localRoom = getLocalRoom(roomId);
+      if (localRoom) {
+        setRoom(localRoom);
+      }
+      return;
+    }
+
     try {
       const res = await fetch(`/api/rooms/${roomId}`);
-      if (res.ok) {
+      const contentType = res.headers.get("content-type");
+      if (res.ok && (!contentType || !contentType.includes("text/html"))) {
         const data: Room = await res.json();
         setRoom(data);
         
@@ -219,6 +330,25 @@ export default function GroupDecider({
     setLoading(true);
     setErrorMsg(null);
 
+    const cleanName = username.trim();
+
+    if (roomId.toUpperCase().startsWith('L') || isLocalMode) {
+      const updated = updateLocalRoom(roomId, (rm) => {
+        if (rm.voters[cleanName] === undefined) {
+          rm.voters[cleanName] = null;
+        }
+      });
+      if (updated) {
+        localStorage.setItem(USER_NAME_KEY, cleanName);
+        setIsJoined(true);
+        setRoom(updated);
+      } else {
+        setErrorMsg("Ruangan lokal tidak ditemukan.");
+      }
+      setLoading(false);
+      return;
+    }
+
     try {
       const res = await fetch(`/api/rooms/${roomId}/join`, {
         method: 'POST',
@@ -235,7 +365,23 @@ export default function GroupDecider({
       setIsJoined(true);
       await fetchRoomData();
     } catch (e: any) {
-      setErrorMsg(e.message);
+      // Attempt local fallback join
+      const localRoom = getLocalRoom(roomId);
+      if (localRoom) {
+        const updated = updateLocalRoom(roomId, (rm) => {
+          if (rm.voters[cleanName] === undefined) {
+            rm.voters[cleanName] = null;
+          }
+        });
+        if (updated) {
+          setIsLocalMode(true);
+          localStorage.setItem(USER_NAME_KEY, cleanName);
+          setIsJoined(true);
+          setRoom(updated);
+        }
+      } else {
+        setErrorMsg(e.message);
+      }
     } finally {
       setLoading(false);
     }
@@ -244,6 +390,19 @@ export default function GroupDecider({
   // Cast vote
   const handleCastVote = async (optionId: string | null) => {
     if (!roomId || !username || !isJoined) return;
+    
+    if (roomId.toUpperCase().startsWith('L') || isLocalMode) {
+      const currentVote = room?.voters[username];
+      const targetVote = currentVote === optionId ? null : optionId;
+      const updated = updateLocalRoom(roomId, (rm) => {
+        rm.voters[username] = targetVote;
+      });
+      if (updated) {
+        setRoom(updated);
+      }
+      return;
+    }
+
     try {
       const currentVote = room?.voters[username];
       const targetVote = currentVote === optionId ? null : optionId; // toggle off if double clicked
@@ -267,6 +426,31 @@ export default function GroupDecider({
   const handleAddOptionRealtime = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!addOptionVal.trim() || !roomId) return;
+
+    if (roomId.toUpperCase().startsWith('L') || isLocalMode) {
+      const cleanText = addOptionVal.trim();
+      const currentRoom = getLocalRoom(roomId);
+      if (currentRoom && currentRoom.options.some(o => o.text.toLowerCase() === cleanText.toLowerCase())) {
+        alert("Pilihan tersebut sudah ada.");
+        return;
+      }
+
+      const updated = updateLocalRoom(roomId, (rm) => {
+        const idx = rm.options.length;
+        const newOpt: Option = {
+          id: `opt-${idx}-${Math.random().toString(36).substring(2, 7)}`,
+          text: cleanText,
+          isEliminated: false,
+          color: pastelColors[idx % pastelColors.length]
+        };
+        rm.options.push(newOpt);
+      });
+      if (updated) {
+        setRoom(updated);
+        setAddOptionVal('');
+      }
+      return;
+    }
 
     try {
       const res = await fetch(`/api/rooms/${roomId}/add-option`, {
@@ -303,6 +487,25 @@ export default function GroupDecider({
       return;
     }
 
+    if (roomId.toUpperCase().startsWith('L') || isLocalMode) {
+      const updated = updateLocalRoom(roomId, (rm) => {
+        rm.options = rm.options.filter(o => o.id !== optionId);
+        for (const vName of Object.keys(rm.voters)) {
+          if (rm.voters[vName] === optionId) {
+            delete rm.voters[vName];
+          }
+        }
+        if (rm.resultOptionId === optionId) {
+          rm.resultOptionId = null;
+          rm.isEnded = false;
+        }
+      });
+      if (updated) {
+        setRoom(updated);
+      }
+      return;
+    }
+
     try {
       const res = await fetch(`/api/rooms/${roomId}/delete-option`, {
         method: 'POST',
@@ -334,8 +537,6 @@ export default function GroupDecider({
     }
 
     // Determine the winner from voters weights or random
-    // Dynamic weight logic: Each option gets weights according to current room votes
-    // Compute votes tally
     const tallies: { [key: string]: number } = {};
     active.forEach(o => tallies[o.id] = 1); // Baseline weight of 1
 
@@ -357,6 +558,23 @@ export default function GroupDecider({
     }
 
     const winnerId = weightedPool[Math.floor(Math.random() * weightedPool.length)];
+
+    if (roomId.toUpperCase().startsWith('L') || isLocalMode) {
+      const spinningRoom = updateLocalRoom(roomId, (rm) => {
+        rm.spinning = true;
+      });
+      if (spinningRoom) setRoom(spinningRoom);
+
+      setTimeout(() => {
+        const endedRoom = updateLocalRoom(roomId, (rm) => {
+          rm.spinning = true;
+          rm.resultOptionId = winnerId;
+          rm.isEnded = true;
+        });
+        if (endedRoom) setRoom(endedRoom);
+      }, 300);
+      return;
+    }
 
     try {
       // 1. Notify spinning set true
@@ -384,9 +602,38 @@ export default function GroupDecider({
   const handleVetoGroup = async () => {
     if (!roomId || !room?.resultOptionId) return;
     
-    try {
-      if (soundEnabled) playVetoSound();
+    if (soundEnabled) playVetoSound();
 
+    if (roomId.toUpperCase().startsWith('L') || isLocalMode) {
+      const optionId = room.resultOptionId;
+      const updated = updateLocalRoom(roomId, (rm) => {
+        const opt = rm.options.find(o => o.id === optionId);
+        if (opt) opt.isEliminated = true;
+        if (!rm.vetoedOptionIds.includes(optionId)) {
+          rm.vetoedOptionIds.push(optionId);
+        }
+        for (const voterName in rm.voters) {
+          if (rm.voters[voterName] === optionId) {
+            rm.voters[voterName] = null;
+          }
+        }
+        rm.resultOptionId = null;
+        rm.isEnded = false;
+        rm.spinning = false;
+      });
+      if (updated) {
+        setRoom(updated);
+        const remainCount = updated.options.filter(o => !o.isEliminated).length;
+        if (remainCount >= 2) {
+          setTimeout(() => {
+            handleSpinGroup();
+          }, 500);
+        }
+      }
+      return;
+    }
+
+    try {
       // Submit Veto
       const res = await fetch(`/api/rooms/${roomId}/veto`, {
         method: 'POST',
@@ -419,6 +666,24 @@ export default function GroupDecider({
   // Reset entire room (Full reset: restores Veto, clears votes)
   const handleResetGroup = async () => {
     if (!roomId) return;
+
+    if (roomId.toUpperCase().startsWith('L') || isLocalMode) {
+      const updated = updateLocalRoom(roomId, (rm) => {
+        rm.isEnded = false;
+        rm.spinning = false;
+        rm.resultOptionId = null;
+        rm.vetoedOptionIds = [];
+        rm.options.forEach(o => o.isEliminated = false);
+        for (const voterName in rm.voters) {
+          rm.voters[voterName] = null;
+        }
+      });
+      if (updated) {
+        setRoom(updated);
+      }
+      return;
+    }
+
     try {
       const res = await fetch(`/api/rooms/${roomId}/reset`, {
         method: 'POST',
@@ -624,9 +889,15 @@ export default function GroupDecider({
         <div className="bg-white border-2 border-gray-150 rounded-[24px] p-6 shadow-sm space-y-4">
           <div className="flex items-center justify-between">
             <h3 className="text-xs font-black text-gray-400 uppercase tracking-widest">Decision Stage</h3>
-            <span className="text-[10px] font-bold text-[#10B981] animate-pulse flex items-center gap-1">
-              <span className="w-1.5 h-1.5 rounded-full bg-[#10B981]" /> Real-time Terkoneksi
-            </span>
+            {isLocalMode ? (
+              <span className="text-[10px] font-black text-[#FF6584] animate-pulse flex items-center gap-1.5 bg-[#FFF0F3] px-2 py-1 rounded-full border border-[#FFD5E5]">
+                <span className="w-1.5 h-1.5 rounded-full bg-[#FF6584]" /> Mode Lokal (Offline/Vercel)
+              </span>
+            ) : (
+              <span className="text-[10px] font-bold text-[#10B981] animate-pulse flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-[#10B981]" /> Real-time Terkoneksi
+              </span>
+            )}
           </div>
 
           <DynamicCarousel
