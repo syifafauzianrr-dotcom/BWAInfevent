@@ -63,7 +63,7 @@ async function startServer() {
     
     // Construct Options
     const options: Option[] = optionsText.map((text: string, idx: number) => ({
-      id: `opt-${idx}-${Math.random().toString(36).substr(2, 5)}`,
+      id: `opt-${idx}-${Math.random().toString(36).substring(2, 7)}`,
       text: text.trim(),
       isEliminated: false,
       color: colors[idx % colors.length]
@@ -170,7 +170,7 @@ async function startServer() {
 
     const idx = room.options.length;
     const newOpt: Option = {
-      id: `opt-${idx}-${Math.random().toString(36).substr(2, 5)}`,
+      id: `opt-${idx}-${Math.random().toString(36).substring(2, 7)}`,
       text: cleanText,
       isEliminated: false,
       color: colors[idx % colors.length]

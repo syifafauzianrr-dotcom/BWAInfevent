@@ -160,7 +160,12 @@ export default function GroupDecider({
       // Auto register name as creator (or wait for join login screen)
       // We will show the join credential card next
     } catch (e: any) {
-      setErrorMsg(e.message || "Gagal menghubungi server.");
+      const errMsg = e.message || "";
+      if (errMsg.includes("Unexpected token") || errMsg.includes("not valid JSON")) {
+        setErrorMsg("Server sedang melakukan persiapan/membangun ulang setelah update. Harap tunggu 3-5 detik lalu klik konfirmasi lagi! 🚀");
+      } else {
+        setErrorMsg(errMsg || "Gagal menghubungi server.");
+      }
     } finally {
       setLoading(false);
     }
