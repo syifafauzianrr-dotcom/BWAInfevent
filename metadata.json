@@ -1,0 +1,6 @@
+{
+  "name": "PilihMana",
+  "description": "Decider App modern dan interaktif untuk membantu orang yang suka overthinking menghemat energi otak dalam memilih makanan, film, atau aktivitas lainnya.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
