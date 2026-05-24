@@ -26,6 +26,38 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
+const BUCKET_ID = "pilihmanav2_f8d2";
+
+// Async Sync helper to backup room to cloud
+const saveToCloud = async (roomId: string, room: Room) => {
+  try {
+    await fetch(`https://kvdb.io/${BUCKET_ID}/${roomId.toUpperCase()}`, {
+      method: 'POST',
+      body: JSON.stringify(room)
+    });
+  } catch (e) {
+    console.warn("Cloud sync warning (not connected or rate limited):", e);
+  }
+};
+
+// Async fetch helper to load room from cloud
+const getFromCloud = async (roomId: string): Promise<Room | null> => {
+  try {
+    const res = await fetch(`https://kvdb.io/${BUCKET_ID}/${roomId.toUpperCase()}`);
+    if (res.ok) {
+      const text = await res.text();
+      // Ensure it's valid JSON representing a Room
+      const data = JSON.parse(text);
+      if (data && data.id && data.options) {
+        return data as Room;
+      }
+    }
+  } catch (e) {
+    console.warn("Cloud fetch warning:", e);
+  }
+  return null;
+};
+
 // Local simulated rooms database helper
 const getLocalRooms = (): Record<string, Room> => {
   try {
@@ -65,6 +97,7 @@ const createLocalRoom = (title: string, description: string, optionsText: string
   const rooms = getLocalRooms();
   rooms[roomId] = newRoom;
   saveLocalRooms(rooms);
+  saveToCloud(roomId, newRoom); // Asynchronously sync to cloud
   return newRoom;
 };
 
@@ -80,6 +113,7 @@ const updateLocalRoom = (id: string, updater: (room: Room) => void): Room | null
   updater(room);
   rooms[id.toUpperCase()] = room;
   saveLocalRooms(rooms);
+  saveToCloud(id, room); // Asynchronously sync update to cloud
   return room;
 };
 
@@ -139,15 +173,6 @@ export default function GroupDecider({
       }
       fetchRoomData();
       
-      const isLoc = roomId.toUpperCase().startsWith('L');
-      if (isLoc) {
-        if (pollingIntervalRef.current) {
-          clearInterval(pollingIntervalRef.current);
-          pollingIntervalRef.current = null;
-        }
-        return;
-      }
-
       // Start polling every 1.5 seconds for real-time synchronization
       if (pollingIntervalRef.current) clearInterval(pollingIntervalRef.current);
       
@@ -249,7 +274,19 @@ export default function GroupDecider({
     if (!roomId) return;
     
     if (roomId.toUpperCase().startsWith('L') || isLocalMode) {
-      const localRoom = getLocalRoom(roomId);
+      let localRoom = getLocalRoom(roomId);
+      if (!localRoom) {
+        setLoading(true);
+        const cloudRoom = await getFromCloud(roomId);
+        setLoading(false);
+        if (cloudRoom) {
+          localRoom = cloudRoom;
+          const rooms = getLocalRooms();
+          rooms[roomId.toUpperCase()] = cloudRoom;
+          saveLocalRooms(rooms);
+        }
+      }
+
       if (localRoom) {
         setRoom(localRoom);
         setIsLocalMode(true);
@@ -258,7 +295,7 @@ export default function GroupDecider({
           setIsJoined(true);
         }
       } else {
-        setErrorMsg("Ruangan lokal tidak ditemukan.");
+        setErrorMsg("Ruangan tidak ditemukan online maupun offline.");
         setRoomId(null);
       }
       return;
@@ -279,7 +316,22 @@ export default function GroupDecider({
         setIsJoined(true);
       }
     } catch (e: any) {
-      const localRoom = getLocalRoom(roomId);
+      let localRoom = getLocalRoom(roomId);
+      if (!localRoom) {
+        // Dual defense: attempt to load from cloud storage
+        try {
+          const cloudRoom = await getFromCloud(roomId);
+          if (cloudRoom) {
+            localRoom = cloudRoom;
+            const rooms = getLocalRooms();
+            rooms[roomId.toUpperCase()] = cloudRoom;
+            saveLocalRooms(rooms);
+          }
+        } catch (errCloud) {
+          console.error("Cloud fallback fetch failed:", errCloud);
+        }
+      }
+
       if (localRoom) {
         setRoom(localRoom);
         setIsLocalMode(true);
@@ -288,7 +340,7 @@ export default function GroupDecider({
           setIsJoined(true);
         }
       } else {
-        setErrorMsg("Harap tunggu sebentar, server sedang mempersiapkan koneksi...");
+        setErrorMsg("Menghubungkan ke ruangan... Harap tunggu sebentar.");
         // Non-blocking, keep trying
       }
     }
@@ -299,9 +351,17 @@ export default function GroupDecider({
     if (!roomId) return;
     
     if (roomId.toUpperCase().startsWith('L') || isLocalMode) {
-      const localRoom = getLocalRoom(roomId);
-      if (localRoom) {
-        setRoom(localRoom);
+      const cloudRoom = await getFromCloud(roomId);
+      if (cloudRoom) {
+        const rooms = getLocalRooms();
+        rooms[roomId.toUpperCase()] = cloudRoom;
+        saveLocalRooms(rooms);
+        setRoom(cloudRoom);
+      } else {
+        const localRoom = getLocalRoom(roomId);
+        if (localRoom) {
+          setRoom(localRoom);
+        }
       }
       return;
     }
@@ -317,9 +377,31 @@ export default function GroupDecider({
         if (savedName && data.voters[savedName] !== undefined) {
           setIsJoined(true);
         }
+      } else {
+        // Fallback silently to cloud fetch in offline/Vercel environments
+        const cloudRoom = await getFromCloud(roomId);
+        if (cloudRoom) {
+          const rooms = getLocalRooms();
+          rooms[roomId.toUpperCase()] = cloudRoom;
+          saveLocalRooms(rooms);
+          setRoom(cloudRoom);
+          setIsLocalMode(true);
+        }
       }
     } catch (e) {
-      // Ignore background errors
+      // Background error: fallback silently to cloud fetch
+      try {
+        const cloudRoom = await getFromCloud(roomId);
+        if (cloudRoom) {
+          const rooms = getLocalRooms();
+          rooms[roomId.toUpperCase()] = cloudRoom;
+          saveLocalRooms(rooms);
+          setRoom(cloudRoom);
+          setIsLocalMode(true);
+        }
+      } catch (errCloud) {
+        console.warn("Background silent cloud fetch fallback failed:", errCloud);
+      }
     }
   };
 
@@ -356,14 +438,24 @@ export default function GroupDecider({
         body: JSON.stringify({ name: username })
       });
 
-      if (!res.ok) {
-        const errData = await res.json();
-        throw new Error(errData.error || "Gagal bergabung.");
+      const contentType = res.headers.get("content-type");
+      if (!res.ok || (contentType && contentType.includes("text/html"))) {
+        let errMessage = "Gagal bergabung ke ruangan server.";
+        if (res.status === 404) {
+          errMessage = "Ruangan tidak ditemukan.";
+        } else if (!res.ok && contentType && contentType.includes("application/json")) {
+          try {
+            const errData = await res.json();
+            errMessage = errData.error || errMessage;
+          } catch (errJson) {}
+        }
+        throw new Error(errMessage);
       }
 
+      const freshRoom = await res.json();
       localStorage.setItem(USER_NAME_KEY, username.trim());
       setIsJoined(true);
-      await fetchRoomData();
+      setRoom(freshRoom);
     } catch (e: any) {
       // Attempt local fallback join
       const localRoom = getLocalRoom(roomId);
@@ -380,7 +472,31 @@ export default function GroupDecider({
           setRoom(updated);
         }
       } else {
-        setErrorMsg(e.message);
+        // Emergency cloud fetch in case guest hasn't loaded the room state locally yet
+        try {
+          const cloudRoom = await getFromCloud(roomId);
+          if (cloudRoom) {
+            const rooms = getLocalRooms();
+            rooms[roomId.toUpperCase()] = cloudRoom;
+            saveLocalRooms(rooms);
+            
+            const updated = updateLocalRoom(roomId, (rm) => {
+              if (rm.voters[cleanName] === undefined) {
+                rm.voters[cleanName] = null;
+              }
+            });
+            if (updated) {
+              setIsLocalMode(true);
+              localStorage.setItem(USER_NAME_KEY, cleanName);
+              setIsJoined(true);
+              setRoom(updated);
+              return;
+            }
+          }
+        } catch (errCloud) {
+          console.error("Emergency cloud fetch failed during join:", errCloud);
+        }
+        setErrorMsg(e.message || "Gagal menghubungi server.");
       }
     } finally {
       setLoading(false);
